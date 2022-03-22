@@ -6,7 +6,7 @@
 #include <unistd.h>
 
 #define FIB_DEV "/dev/fibonacci"
-#define MAX_10P 10000000000000000000ULL
+#define MAX_P10 10000000000000000000ULL
 #define MAX_LENGTH 100
 #define MAX_SIZE 2 + MAX_LENGTH * 7 / 640
 
@@ -37,8 +37,8 @@ void print_fib_BigN(int n, unsigned long long *digits, int len)
         digits[len] = 0;
         for (int j = len - 1; j >= i; j--) {
             value = value << 64 | digits[j];
-            digits[j + 1] = value / MAX_10P;
-            value %= MAX_10P;
+            digits[j + 1] = value / MAX_P10;
+            value %= MAX_P10;
         }
         digits[i] = value;
         len += digits[len] > 0;
@@ -65,7 +65,7 @@ int main(int argc, char *argv[])
 
     // unsigned __int128 buf[1];
     unsigned long long buf[MAX_SIZE];
-    char write_buf[] = "testing writing";
+    // char write_buf[] = "testing writing";
     int offset =
         MAX_LENGTH; /* TODO: try test something bigger than the limit */
 
@@ -79,7 +79,7 @@ int main(int argc, char *argv[])
         long long n;
         sscanf(argv[1], "%lld", &n);
         lseek(fd, n, SEEK_SET);
-        size_t digits_size = (2 + n / 90) * sizeof(unsigned long long);
+        size_t digits_size = (3 + 21 * n / 1900) * sizeof(unsigned long long);
         unsigned long long *buffer = malloc(digits_size);
         sz = read(fd, buffer, digits_size) / sizeof(unsigned long long);
         print_fib_BigN(n, buffer, sz);
@@ -88,10 +88,10 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    for (int i = 0; i <= offset; i++) {
+    /*for (int i = 0; i <= offset; i++) {
         sz = write(fd, write_buf, strlen(write_buf));
         printf("Writing to " FIB_DEV ", returned the sequence %lld\n", sz);
-    }
+    }*/
 
     for (int i = 0; i <= offset; i++) {
         lseek(fd, i, SEEK_SET);

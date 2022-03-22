@@ -4,6 +4,7 @@
 #include <linux/init.h>
 #include <linux/kdev_t.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -25,6 +26,8 @@ MODULE_VERSION("0.1");
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
+static ktime_t kt;
+static int mode = 2;
 static DEFINE_MUTEX(fib_mutex);
 
 struct BigN {
@@ -38,11 +41,15 @@ static struct BigN *init_BigN(int digits_num)
     struct BigN *n = kmalloc(sizeof(struct BigN), GFP_KERNEL);
     if (!n)
         return NULL;
+
+    n->digits = kmalloc(digits_num * sizeof(unsigned long long), GFP_KERNEL);
+    if (!n->digits) {
+        kfree(n);
+        return NULL;
+    }
+
     n->len = 1;
     n->max_len = digits_num;
-    n->digits = kmalloc(digits_num * sizeof(unsigned long long), GFP_KERNEL);
-    if (!n->digits)
-        return NULL;
     for (int i = 0; i < digits_num; i++)
         n->digits[i] = 0ULL;
     return n;
@@ -66,12 +73,25 @@ static void sub_BigN(struct BigN *output,
                      const struct BigN *y)
 {
     unsigned long long borrow = 0;
+    int i = 0;
 
-    for (int i = 0; i < x->len; i++) {
+    while (i < y->len) {
         unsigned long long result = x->digits[i] - borrow;
         borrow = borrow > x->digits[i] || result < y->digits[i];
         result -= y->digits[i];
         output->digits[i] = result;
+        i++;
+    }
+
+    while (borrow && i < x->len) {
+        output->digits[i] = x->digits[i] - borrow;
+        borrow = x->digits[i] == 0;
+        i++;
+    }
+
+    while (i < x->len) {
+        output->digits[i] = x->digits[i];
+        i++;
     }
 
     output->len = x->len;
@@ -83,19 +103,40 @@ static void add_BigN(struct BigN *output,
                      const struct BigN *x,
                      const struct BigN *y)
 {
-    int max_len = max(x->len, y->len);
+    const struct BigN *max, *min;
+    if (x->len > y->len) {
+        max = x;
+        min = y;
+    } else {
+        max = y;
+        min = x;
+    }
     unsigned long long carry = 0;
+    int i = 0;
 
-    for (int i = 0; i < max_len; i++) {
-        unsigned long long result = x->digits[i] + carry;
-        carry = x->digits[i] > ~carry || result > ~y->digits[i];
-        result += y->digits[i];
+    while (i < min->len) {
+        unsigned long long result = max->digits[i] + carry;
+        carry = max->digits[i] > ~carry || result > ~min->digits[i];
+        result += min->digits[i];
         output->digits[i] = result;
+        i++;
     }
 
+    while (carry && i < max->len) {
+        output->digits[i] = max->digits[i] + carry;
+        carry = max->digits[i] > ~carry;
+        i++;
+    }
+
+    while (i < max->len) {
+        output->digits[i] = max->digits[i];
+        i++;
+    }
+
+    output->len = max->len;
     if (output->len < output->max_len) {
-        output->digits[max_len] = carry;
-        output->len = max_len + carry;
+        output->digits[output->len] = carry;
+        output->len += carry;
     }
 }
 
@@ -120,24 +161,103 @@ static void mul_BigN(struct BigN *output,
 
     for (int i = 0; i < x->len; i++) {
         for (int j = 0; j < y->len; j++) {
-            unsigned __int128 result =
-                (unsigned __int128) x->digits[i] * y->digits[j];
-
+            unsigned long long high, low;
+            __asm__("mulq %3"
+                    : "=a"(low), "=d"(high)
+                    : "%0"(x->digits[i]), "rm"(y->digits[j]));
             /* add the lower of result */
-            carry->digits[i + j + 1] +=
-                output->digits[i + j] > (unsigned long long) (~result & ~0ULL);
-            output->digits[i + j] += result & ~0ULL;
+            carry->digits[i + j + 1] += output->digits[i + j] > ~low;
+            output->digits[i + j] += low;
 
             /* add the upper of result */
-            result >>= 64;
             if (i + j + 2 < output->max_len)
-                carry->digits[i + j + 2] +=
-                    output->digits[i + j + 1] > (unsigned long long) ~result;
-            output->digits[i + j + 1] += result;
+                carry->digits[i + j + 2] += output->digits[i + j + 1] > ~high;
+            output->digits[i + j + 1] += high;
         }
     }
     add_BigN(output, output, carry);
     output->len -= output->digits[output->len - 1] == 0;
+}
+
+static void mul_BigN_test(struct BigN *output,
+                          const struct BigN *x,
+                          const struct BigN *y,
+                          struct BigN *buf,
+                          struct BigN *carry)
+{
+    if (x->len == 1 || y->len == 1) {
+        unsigned long long low = 0;
+        for (int i = 0; i < y->len; i++) {
+            for (int j = 0; j < x->len; j++) {
+                unsigned long long result, high;
+                __asm__("mulq %3"
+                        : "=a"(result), "=d"(high)
+                        : "%0"(x->digits[j]), "rm"(y->digits[i]));
+                high += result > ~low;
+                output->digits[i + j] = result + low;
+                low = high;
+            }
+        }
+        output->len = x->len + y->len;
+        output->digits[output->len - 1] = low;
+        output->len -= output->digits[output->len - 1] == 0;
+        return;
+    }
+    if (x->len <= 8 || y->len <= 8) {
+        mul_BigN(output, x, y, buf);
+        return;
+    }
+
+    int m = (max(x->len, y->len) + 1) / 2;
+    struct BigN buf_right = *buf;
+    struct BigN buf_left = *buf;
+    struct BigN x_left = *x;
+    struct BigN x_right = *x;
+    struct BigN y_left = *y;
+    struct BigN y_right = *y;
+    x_left.digits += m;
+    y_left.digits += m;
+    x_left.len -= m;
+    y_left.len -= m;
+    x_right.len = m;
+    y_right.len = m;
+
+    /* caculate for y_left + y_right */
+    add_BigN(&buf_right, &y_left, &y_right);
+    buf_left.digits += buf_right.len;
+    buf_left.max_len -= buf_right.len;
+
+    /* caculate for x_left + x_right */
+    add_BigN(&buf_left, &x_left, &x_right);
+
+    /* caculate for middle, rigt, left and whole product */
+    output->digits += m;
+    output->max_len -= m;
+    buf->digits += buf_left.len + buf_right.len;
+    mul_BigN_test(output, &buf_left, &buf_right, buf, carry);
+
+    buf->digits = buf_right.digits + m * 2;
+    buf_right.max_len = m * 2;
+    mul_BigN_test(&buf_right, &x_right, &y_right, buf, carry);
+    sub_BigN(output, output, &buf_right);
+    for (int i = 0; i < m; i++)
+        output->digits[i - m] = buf_right.digits[i];
+    buf_right.digits += m;
+    buf_right.len -= m;
+    add_BigN(output, output, &buf_right);
+
+    buf_right.digits -= m;
+    mul_BigN_test(&buf_right, &x_left, &y_left, buf, carry);
+    sub_BigN(output, output, &buf_right);
+    output->digits += m;
+    output->len -= m;
+    output->max_len -= m;
+    add_BigN(output, output, &buf_right);
+
+    output->digits -= m * 2;
+    output->len += m * 2;
+    output->max_len += m * 2;
+    buf->digits -= m * 2;
 }
 
 static void lshift_BigN(struct BigN *output)
@@ -155,7 +275,7 @@ static void lshift_BigN(struct BigN *output)
     }
 }
 
-static void constant_add_BigN(struct BigN *output, unsigned long long c)
+static void add_constant_BigN(struct BigN *output, unsigned long long c)
 {
     unsigned long long carry = output->digits[0] > ~c;
     output->digits[0] += c;
@@ -171,7 +291,7 @@ static void constant_add_BigN(struct BigN *output, unsigned long long c)
     }
 }
 
-static void constant_sub_BigN(struct BigN *output, unsigned long long c)
+static void sub_constant_BigN(struct BigN *output, unsigned long long c)
 {
     unsigned long long borrow = c > output->digits[0];
     output->digits[0] -= c;
@@ -206,7 +326,7 @@ static struct BigN *fib_sequence_fast(long long k)
         mul_BigN(bb, b, b, carry);
         sub_BigN(a, bb, aa);
         lshift_BigN(a);
-        (k & (i << 1)) ? constant_add_BigN(a, 2) : constant_sub_BigN(a, 2);
+        (k & (i << 1)) ? add_constant_BigN(a, 2) : sub_constant_BigN(a, 2);
         sub_BigN(a, a, aa);
         add_BigN(b, aa, bb);
         if (k & i) {
@@ -234,70 +354,80 @@ static struct BigN *fib_sequence_fast(long long k)
     return a;
 }
 
-/*static struct BigN *fib_sequence_iterative(long long k)
+static struct BigN *fib_sequence_test(long long k)
 {
+    /* log2(f(n)) = 0.6942 * n - 1.16 */
     int digits_num = 2 + k * 7 / 640;
-    struct BigN *f_n = init_BigN(digits_num);
-    struct BigN *f_n_next = init_BigN(digits_num);
+    struct BigN *a = init_BigN(digits_num);
+    struct BigN *b = init_BigN(digits_num);
+    struct BigN *aa = init_BigN(digits_num);
+    struct BigN *bb = init_BigN(digits_num);
+    struct BigN *carry = NULL;  // init_BigN(digits_num);
+    struct BigN *buf = init_BigN(digits_num);
+    unsigned long long i = 1ULL << fls(k) >> 1;
 
-    if(!(f_n && f_n_next))
+    if (!(a && b && aa && bb && buf))
         return NULL;
+    a->digits[0] = 0ULL;
+    b->digits[0] = 1ULL;
 
-    f_n->digits[0] = 0ULL;
-    f_n_next->digits[0] = 1ULL;
-
-    for (long long i = 2; i <= k; i++) {
-        add_BigN(f_n, f_n, f_n_next);
-        swap_BigN(f_n, f_n_next);
-    }
-    free_BigN(f_n);
-
-    if(k == 0)
-        f_n_next->digits[0] = 0ULL;
-    return f_n_next;
-}*/
-
-/*static unsigned __int128 fib_sequence_fast(long long k)
-{
-    unsigned __int128 a = 0, b = 1;
-    unsigned __int128 aa = 0, bb = 0;
-    unsigned __int128 plus_two = 2, minus_two = -plus_two;
-    long long i = 1LL << (fls(k) - 1);
-
-    if(k < 2)
-        return k;
-
-    while(i) {
-        aa = a*a;
-        bb = b*b;
-        a = (bb - aa) * 2 - aa + ((k & i << 1) ? 2 : -2);
-        b = aa + bb;
-        //unsigned __int128 t1 = a * (2 * b - a);
-        //unsigned __int128 t2 = a * a + b * b;
-        //a = t1; b = t2; // m *= 2
+    while (i > 1) {
+        mul_BigN_test(aa, a, a, buf, carry);
+        mul_BigN_test(bb, b, b, buf, carry);
+        sub_BigN(a, bb, aa);
+        lshift_BigN(a);
+        (k & (i << 1)) ? add_constant_BigN(a, 2) : sub_constant_BigN(a, 2);
+        sub_BigN(a, a, aa);
+        add_BigN(b, aa, bb);
         if (k & i) {
-            aa = a + b; // m++
-            a = b; b = aa;
+            add_BigN(a, a, b);  // m++
+            swap_BigN(a, b);
         }
         i >>= 1;
     }
+    /* last round */
+    if (k & i) {
+        mul_BigN_test(aa, a, a, buf, carry);
+        mul_BigN_test(bb, b, b, buf, carry);
+        add_BigN(a, aa, bb);
 
+    } else {
+        lshift_BigN(b);
+        sub_BigN(b, b, a);
+        mul_BigN_test(aa, b, a, buf, carry);
+        swap_BigN(aa, a);
+    }
+
+    free_BigN(b);
+    free_BigN(aa);
+    free_BigN(bb);
+    // free_BigN(carry);
+    free_BigN(buf);
     return a;
 }
 
-static unsigned __int128 fib_sequence_iterative(long long k)
+static struct BigN *fib_sequence_iterative(long long k)
 {
-    unsigned __int128 f_n = 0;
-    unsigned __int128 f_n_next = 1;
-    unsigned __int128 f_k = k;
+    int digits_num = 2 + k * 7 / 640;
+    struct BigN *f_n_prev = init_BigN(digits_num);
+    struct BigN *f_n = init_BigN(digits_num);
+
+    if (!(f_n_prev && f_n))
+        return NULL;
+
+    f_n_prev->digits[0] = 0ULL;
+    f_n->digits[0] = 1ULL;
 
     for (long long i = 2; i <= k; i++) {
-        f_k = f_n + f_n_next;
-        f_n = f_n_next;
-        f_n_next = f_k;
+        add_BigN(f_n_prev, f_n_prev, f_n);
+        swap_BigN(f_n_prev, f_n);
     }
-    return f_k;
-}*/
+    if (k == 0)
+        f_n->digits[0] = 0ULL;
+
+    free_BigN(f_n_prev);
+    return f_n;
+}
 
 static int fib_open(struct inode *inode, struct file *file)
 {
@@ -320,21 +450,40 @@ static ssize_t fib_read(struct file *file,
                         size_t size,
                         loff_t *offset)
 {
-    struct BigN *fib_result = fib_sequence_fast(*offset);
-    if (!fib_result)
+    struct BigN *fib_result;
+
+    kt = ktime_get();
+    switch (mode) {
+    case 1:
+        fib_result = fib_sequence_iterative(*offset);
+        break;
+    case 2:
+        fib_result = fib_sequence_fast(*offset);
+        break;
+    case 3:
+        fib_result = fib_sequence_test(*offset);
+        break;
+    default:
+        fib_result = fib_sequence_test(*offset);
+    }
+    kt = ktime_sub(ktime_get(), kt);
+    if (!fib_result) {
+        printk("Memory allocation fail");
         return -1;
+    }
 
     size_t sz = fib_result->len * sizeof(unsigned long long);
     if (size < sz) {
         free_BigN(fib_result);
-        /*printk("Buffer is too small",sz);*/
+        printk("Buffer is too small");
+        printk("%ld %ld", size, sz);
         return -1;
     }
 
     int remain = copy_to_user(buf, fib_result->digits, sz);
     if (remain) {
         free_BigN(fib_result);
-        /*printk("Copy fail",sz);*/
+        printk("Copy fail");
         return -1;
     }
 
@@ -348,7 +497,9 @@ static ssize_t fib_write(struct file *file,
                          size_t size,
                          loff_t *offset)
 {
-    return 1;
+    if (size)
+        mode = size;
+    return ktime_to_ns(kt);
 }
 
 static loff_t fib_device_lseek(struct file *file, loff_t offset, int orig)
